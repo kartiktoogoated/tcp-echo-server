@@ -1,99 +1,112 @@
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, tcp::{OwnedReadHalf, OwnedWriteHalf}};
+use tokio::sync::{Mutex, broadcast};
+use std::sync::Arc;
 
-const MAX_MESSAGE_SIZE: usize = 1024; // 1KB per message
+const MAX_MESSAGE_SIZE: usize = 1024;
 
-fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:7878")?;
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:7878").await?;
     println!("Chat server listening on 127.0.0.1:7878");
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                println!("Client connected");
+    let (shutdown_tx, _) = broadcast::channel(1);
 
-                // Wrap the stream in Arc<Mutex<>> so multiple threads can access it
-                let stream = Arc::new(Mutex::new(stream.try_clone()?));
+    loop {
+        let (stream, _) = listener.accept().await?;
+        println!("Client connected");
 
-                // Client reading thread
-                let client_stream = Arc::clone(&stream);
-                let client_thread = thread::spawn(move || {
-                    let mut reader = BufReader::new(client_stream.lock().unwrap().try_clone().unwrap());
-                    let mut buffer = String::new();
+        let (read_half, write_half) = stream.into_split();
+        let write_half = Arc::new(Mutex::new(write_half));
 
-                    loop {
-                        buffer.clear(); // Clear the buffer before reading a new message
+        let shutdown_rx = shutdown_tx.subscribe();
+        let write_half_clone = Arc::clone(&write_half);
 
-                        match reader.read_line(&mut buffer) {
-                            Ok(0) => {
-                                println!("Client disconnected");
-                                break;
-                            }
-                            Ok(_) => {
-                                if buffer.len() > MAX_MESSAGE_SIZE {
-                                    eprintln!("Message too long! Disconnecting client.");
-                                    break;
-                                }
+        let client_task = tokio::spawn(handle_client(read_half, write_half_clone, shutdown_rx));
+        let shutdown_tx_clone = shutdown_tx.clone();
+        let server_task = tokio::spawn(handle_server(write_half, shutdown_tx_clone));
 
-                                let message = buffer.trim();
-                                if message.eq_ignore_ascii_case("exit") {
-                                    println!("Client sent exit. Closing connection");
-                                    break;
-                                }
+        let _ = client_task.await;
+        let _ = server_task.await;
 
-                                println!("Client sent: {}", message);
+        println!("Connection closed. Waiting for new client...");
+    }
+}
 
-                                // Send message back to client
-                                let mut locked_stream = client_stream.lock().unwrap();
-                                let response = format!("You said: {}\n", message);
-                                if let Err(e) = locked_stream.write_all(response.as_bytes()) {
-                                    eprintln!("Error sending to client: {}", e);
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Error reading from client: {}", e);
-                                break;
-                            }
-                        }
+async fn handle_client(
+    read_half: OwnedReadHalf,
+    write_half: Arc<Mutex<OwnedWriteHalf>>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let mut reader = BufReader::new(read_half);
+    let mut buffer = String::new();
+
+    loop {
+        tokio::select! {
+            res = reader.read_line(&mut buffer) => {
+                match res {
+                    Ok(0) => {
+                        println!("Client disconnected");
+                        break;
                     }
-                });
-
-                // Server operator thread
-                let server_stream = Arc::clone(&stream);
-                let server_thread = thread::spawn(move || {
-                    let stdin = io::stdin();
-                    for line in stdin.lock().lines() {
-                        let line = line.unwrap();
-                        if line.eq_ignore_ascii_case("exit") {
-                            println!("Server exiting connection");
+                    Ok(_) => {
+                        if buffer.len() > MAX_MESSAGE_SIZE {
+                            eprintln!("Message too long! Disconnecting client.");
                             break;
                         }
 
-                        println!("Server operator sent: {}", line);
+                        let message = buffer.trim();
+                        if message.eq_ignore_ascii_case("exit") {
+                            println!("Client sent exit. Closing connection.");
+                            break;
+                        }
 
-                        let mut locked_stream = server_stream.lock().unwrap();
-                        let response = format!("Server says: {}\n", line);
-                        if let Err(e) = locked_stream.write_all(response.as_bytes()) {
+                        println!("Client sent: {}", message);
+
+                        let mut writer = write_half.lock().await;
+                        let response = format!("You said: {}\n", message);
+                        if let Err(e) = writer.write_all(response.as_bytes()).await {
                             eprintln!("Error sending to client: {}", e);
                             break;
                         }
+                        buffer.clear();
                     }
-                });
-
-                // Wait for both threads to finish
-                let _ = client_thread.join();
-                let _ = server_thread.join();
-
-                println!("Connection closed. Waiting for new client...");
+                    Err(e) => {
+                        eprintln!("Error reading from client: {}", e);
+                        break;
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("Failed to accept connection: {}", e);
+
+            _ = shutdown_rx.recv() => {
+                println!("Client handler received shutdown signal.");
+                break;
             }
         }
     }
+}
 
-    Ok(())
+async fn handle_server(
+    write_half: Arc<Mutex<OwnedWriteHalf>>,
+    shutdown_tx: broadcast::Sender<()>,
+) {
+    let stdin = io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.eq_ignore_ascii_case("exit") {
+            println!("Server exiting connection.");
+            let _ = shutdown_tx.send(()); // Signal shutdown to all listeners
+            break;
+        }
+
+        println!("Server operator sent: {}", line);
+
+        let mut writer = write_half.lock().await;
+        let response = format!("Server says: {}\n", line);
+        if let Err(e) = writer.write_all(response.as_bytes()).await {
+            eprintln!("Error sending to client: {}", e);
+            break;
+        }
+    }
 }
