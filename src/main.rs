@@ -1,8 +1,11 @@
+use chrono::Local;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, broadcast, RwLock};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-use chrono::Local;
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 const MAX_MESSAGE_SIZE: usize = 1024;
 static CLIENT_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -31,7 +34,12 @@ async fn main() -> io::Result<()> {
         let id = CLIENT_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let client_name = format!("Client {}", id);
 
-        println!("[{}] New client connected: {} from {}", timestamp(), client_name, addr);
+        println!(
+            "[{}] New client connected: {} from {}",
+            timestamp(),
+            client_name,
+            addr
+        );
 
         let shutdown_rx = shutdown_tx.subscribe();
         let clients = clients.clone();
@@ -123,7 +131,10 @@ async fn handle_server_input(clients: SharedClients, shutdown_tx: broadcast::Sen
     let stdin = io::stdin();
     let mut lines = BufReader::new(stdin).lines();
 
-    println!("[{}] Type messages to broadcast, or 'exit' to shutdown server.", timestamp());
+    println!(
+        "[{}] Type messages to broadcast, or 'exit' to shutdown server.",
+        timestamp()
+    );
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.eq_ignore_ascii_case("exit") {
